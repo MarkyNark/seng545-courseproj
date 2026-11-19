@@ -1,119 +1,174 @@
+using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
 /// <summary>
-/// Fast, non-destructive Demo 1 prototype for the existing SampleScene.
-/// Uses either keyboard or the optional OpenHaptics stylus to drive identical
-/// grab/sort behavior. Physical force output still needs separate hardware setup.
+/// Mass-based canister sorting for ENSF 545 Demo 1.
+///
+/// The same sorting rules work with either IStylusInput implementation.
+/// This keyboard-completion version leaves OpenHaptics scripts unchanged.
+/// It creates ten identical-looking samples from the team's existing Box mesh.
+/// Only one sample is presented at a time to avoid changing the authored scene.
+///
+/// Keyboard resistance is a SUBSTITUTE cue, not a physical haptic force.
+/// Placement and failed-drop motions are visual animations, not rigidbody physics.
 /// </summary>
 public sealed class Demo1Controller : MonoBehaviour
 {
     public enum InputMode { Keyboard, Haptics, Auto }
+    private enum TrialState { Ready, Practice, Trial, Complete }
 
-    [Header("Choose controller (can change during Play mode)")]
-    public InputMode inputMode = InputMode.Auto;
+    [Header("Input adapter - Keyboard is the safe default for local testing")]
+    public InputMode inputMode = InputMode.Keyboard;
     public KeyboardStylusInput keyboardInput;
     public OpenHapticsStylusInput hapticInput;
-    private Demo1MassHapticEffect massFeedback;
 
-    [Header("Existing scene objects (auto-found by name if empty)")]
-    public DemoCanister[] canisters;
-    public Transform binAStandard;
-    public Transform binBReject;
-
-    [Header("Demo tuning")]
+    [Header("Trial settings")]
+    [Min(1)] public int trialSampleCount = 10;
+    [Min(5f)] public float practiceSeconds = 60f;
     [Min(0.1f)] public float grabRange = 1f;
     [Min(0.1f)] public float binExtraRadius = 0.3f;
     [Range(0.1f, 1f)] public float anomalousKeyboardMovementRatio = 0.35f;
-    public bool showDebugClassWhileHeld = true;
+    [Min(0.05f)] public float placementAnimationSeconds = 0.35f;
     public bool showCursor = true;
+    public bool showDebugClassWhileHeld = false;
 
+    [Header("Scene references (auto-found if empty)")]
+    public Transform binAStandard;
+    public Transform binBReject;
+
+    /// <summary>One completed placement in a timed mass-sorting trial.</summary>
+    public struct SortRecord
+    {
+        public int CanisterNumber;
+        public bool WasAnomalous;
+        public bool PlacedInRejectBin;
+        public bool Correct;
+        public int DropsBeforeSort;
+        public float ElapsedSeconds;
+    }
+
+    private readonly List<DemoCanister> samples = new List<DemoCanister>();
+    private readonly List<SortRecord> trialRecords = new List<SortRecord>();
+    private readonly List<GameObject> sourceBoxes = new List<GameObject>();
+    private Demo1MassHapticEffect massFeedback;
     private Transform cursorVisual;
     private DemoCanister held;
-    private bool priorGrabHeld;
+    private DemoCanister currentSample;
     private Vector3 holdOffset;
+    private Vector3 spawnCenter;
     private Vector3 initialCursorPosition;
+    private bool priorGrabHeld;
+    private bool transitionInProgress;
+    private bool initializationFailed;
+    private bool[] classification;
+    private TrialState state = TrialState.Ready;
+    private float stateStartTime;
+    private float finalTrialSeconds;
     private int processed;
     private int correct;
-    private string lastMessage = "Move the cursor to a box and hold SPACE to pick it up.";
-    private bool initializationFailed;
+    private int drops;
+    private int currentSampleDrops;
+    private int practicePlacements;
+    private string lastMessage = "Press ENTER for ten samples, or P for 60 seconds of practice.";
+    private string exportedCsvPath;
+    private string sessionId;
 
     private void Awake()
     {
-        FindSceneObjects();
-        if (initializationFailed) return;
+        if (!SetupAuthoredScene())
+        {
+            initializationFailed = true;
+            Debug.LogError("Demo1 V4: Existing Box and two bin objects are required in SampleScene.");
+            return;
+        }
 
         if (keyboardInput == null)
             keyboardInput = gameObject.AddComponent<KeyboardStylusInput>();
         if (hapticInput == null)
             hapticInput = gameObject.AddComponent<OpenHapticsStylusInput>();
-        massFeedback = gameObject.AddComponent<Demo1MassHapticEffect>();
+        massFeedback = gameObject.GetComponent<Demo1MassHapticEffect>();
+        if (massFeedback == null)
+            massFeedback = gameObject.AddComponent<Demo1MassHapticEffect>();
 
-        initialCursorPosition = canisters[0].VisibleBounds.center + Vector3.up * 0.2f;
+        initialCursorPosition = spawnCenter + Vector3.up * 0.2f;
         keyboardInput.SetPosition(initialCursorPosition);
 
         GameObject sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
         sphere.name = "Demo Stylus Cursor (runtime only)";
         sphere.transform.localScale = Vector3.one * 0.22f;
-        Collider collider = sphere.GetComponent<Collider>();
-        if (collider != null) Destroy(collider);
-        Renderer renderer = sphere.GetComponent<Renderer>();
-        if (renderer != null) renderer.material.color = Color.cyan;
+        Collider cursorCollider = sphere.GetComponent<Collider>();
+        if (cursorCollider != null) Destroy(cursorCollider);
+        Renderer sphereRenderer = sphere.GetComponent<Renderer>();
+        if (sphereRenderer != null) sphereRenderer.material.color = Color.cyan;
         cursorVisual = sphere.transform;
+
+        // Ready state deliberately presents no samples until the user starts.
+        HideAllSamples();
     }
 
-    private void FindSceneObjects()
+    private bool SetupAuthoredScene()
     {
-        if (canisters == null || canisters.Length == 0)
+        string[] boxNames = { "Box", "Box (1)", "Box (2)" };
+        foreach (string name in boxNames)
         {
-            List<DemoCanister> found = new List<DemoCanister>();
-            // The three names below are taken directly from the existing scene.
-            string[] names = { "Box", "Box (1)", "Box (2)" };
-            foreach (string name in names)
-            {
-                GameObject obj = GameObject.Find(name);
-                if (obj == null) { Debug.LogError("Demo1: Missing object " + name); continue; }
-                DemoCanister canister = obj.GetComponent<DemoCanister>();
-                if (canister == null) canister = obj.AddComponent<DemoCanister>();
-                canister.anomalous = name == "Box (2)"; // 1 reject among 3 samples
-                found.Add(canister);
-            }
-            canisters = found.ToArray();
+            GameObject box = GameObject.Find(name);
+            if (box != null) sourceBoxes.Add(box);
         }
+        GameObject primary = GameObject.Find("Box");
+        if (primary == null && sourceBoxes.Count > 0)
+            primary = sourceBoxes[0];
+        GameObject firstBin = GameObject.Find("bin (1)");
+        GameObject secondBin = GameObject.Find("bin (2)");
+        if (primary == null || firstBin == null || secondBin == null)
+            return false;
 
         if (binAStandard == null || binBReject == null)
         {
-            GameObject first = GameObject.Find("bin (1)");
-            GameObject second = GameObject.Find("bin (2)");
-            if (first != null && second != null)
-            {
-                Camera view = Camera.main;
-                Vector3 screenRight = view != null ? view.transform.right : Vector3.right;
-                float a = Vector3.Dot(RendererBounds(first.transform).center, screenRight);
-                float b = Vector3.Dot(RendererBounds(second.transform).center, screenRight);
-                binAStandard = a <= b ? first.transform : second.transform;
-                binBReject = a <= b ? second.transform : first.transform;
-            }
+            Vector3 screenRight = Camera.main != null ? Camera.main.transform.right : Vector3.right;
+            float first = Vector3.Dot(RendererBounds(firstBin.transform).center, screenRight);
+            float second = Vector3.Dot(RendererBounds(secondBin.transform).center, screenRight);
+            binAStandard = first <= second ? firstBin.transform : secondBin.transform;
+            binBReject = first <= second ? secondBin.transform : firstBin.transform;
         }
 
-        if (canisters == null || canisters.Length == 0 ||
-            binAStandard == null || binBReject == null)
+        spawnCenter = RendererBounds(primary.transform).center;
+        trialSampleCount = Mathf.Clamp(trialSampleCount, 1, 100);
+
+        // Use the very same mesh/material for every sample: classification is
+        // not leaked through a different model, colour or lid geometry.
+        for (int i = 0; i < trialSampleCount; i++)
         {
-            initializationFailed = true;
-            Debug.LogError("Demo1: Scene references missing. Assign 3 boxes and 2 bins in the Inspector.");
+            GameObject sampleObject = Instantiate(primary, primary.transform.parent);
+            sampleObject.name = "Demo1 sample " + (i + 1);
+            sampleObject.transform.SetPositionAndRotation(primary.transform.position, primary.transform.rotation);
+            sampleObject.transform.localScale = primary.transform.localScale;
+            DemoCanister sample = sampleObject.GetComponent<DemoCanister>();
+            if (sample == null) sample = sampleObject.AddComponent<DemoCanister>();
+            // Existing DemoCanister records its original transform in Awake.
+            samples.Add(sample);
+            sampleObject.SetActive(false);
         }
+
+        // Keep the authored originals in the scene, but remove them from play.
+        // They return automatically when exiting Play mode.
+        foreach (GameObject box in sourceBoxes)
+            box.SetActive(false);
+        classification = new bool[samples.Count];
+        return samples.Count != 0;
     }
 
     private static Bounds RendererBounds(Transform root)
     {
-        Renderer[] renderers = root.GetComponentsInChildren<Renderer>();
-        bool found = false;
-        Bounds result = new Bounds(root.position, Vector3.one);
+        Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+        Bounds result = new Bounds(root.position, Vector3.zero);
+        bool hasRenderer = false;
         foreach (Renderer item in renderers)
         {
             if (!item.enabled) continue;
-            if (!found) { result = item.bounds; found = true; }
+            if (!hasRenderer) { result = item.bounds; hasRenderer = true; }
             else result.Encapsulate(item.bounds);
         }
         return result;
@@ -129,26 +184,41 @@ public sealed class Demo1Controller : MonoBehaviour
     private void Update()
     {
         if (initializationFailed || keyboardInput == null) return;
-        Keyboard keyboard = Keyboard.current;
-        if (keyboard != null)
+        Keyboard kb = Keyboard.current;
+        if (kb != null)
         {
-            if (keyboard.rKey.wasPressedThisFrame) ResetDemo();
-            if (keyboard.tabKey.wasPressedThisFrame)
-                inputMode = inputMode == InputMode.Keyboard ? InputMode.Haptics : InputMode.Keyboard;
+            if (kb.rKey.wasPressedThisFrame) ResetToReady();
+            if (kb.dKey.wasPressedThisFrame &&
+                (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed))
+                showDebugClassWhileHeld = !showDebugClassWhileHeld;
+            if (kb.tabKey.wasPressedThisFrame)
+                inputMode = inputMode == InputMode.Keyboard ? InputMode.Auto : InputMode.Keyboard;
+
+            if (!transitionInProgress &&
+                (state == TrialState.Ready || state == TrialState.Complete))
+            {
+                if (kb.enterKey.wasPressedThisFrame || kb.numpadEnterKey.wasPressedThisFrame)
+                    StartTrial();
+                else if (kb.pKey.wasPressedThisFrame)
+                    StartPractice();
+            }
         }
 
-        // Apply keyboard motion before sampling either input source, so the
-        // stylus and the grabbed mesh see the same updated position.
         keyboardInput.SimulateFrame(Time.deltaTime);
-
         IStylusInput source = SelectedInput();
         if (source == null || !source.IsAvailable) return;
         Vector3 cursor = source.WorldPosition;
-
         if (cursorVisual != null)
         {
             cursorVisual.gameObject.SetActive(showCursor);
             cursorVisual.position = cursor;
+        }
+
+        if (state == TrialState.Practice &&
+            Time.unscaledTime - stateStartTime >= practiceSeconds)
+        {
+            ResetToReady();
+            lastMessage = "Practice finished. Press ENTER to begin the timed trial.";
         }
 
         bool grab = source.GrabHeld;
@@ -156,83 +226,199 @@ public sealed class Demo1Controller : MonoBehaviour
         bool release = !grab && priorGrabHeld;
         priorGrabHeld = grab;
 
+        bool running = state == TrialState.Practice || state == TrialState.Trial;
+        if (!running || transitionInProgress)
+        {
+            keyboardInput.movementMultiplier = 1f;
+            if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+            return;
+        }
+
         if (held == null && press) TryGrab(cursor);
         if (held != null)
         {
-            // Move the entire mesh assembly; keep the grab offset so it doesn't jump.
             held.ShiftVisualCenterTo(cursor + holdOffset);
             if (release) Release(cursor);
         }
 
-        // Keyboard feedback is movement resistance ONLY, not actual haptic force.
         keyboardInput.movementMultiplier = held != null && held.anomalous
             ? anomalousKeyboardMovementRatio : 1f;
-
-        // This is independent of keyboard movement slowdown. The actual Touch
-        // device produces a modest downward force ONLY while a heavy sample
-        // is held, if the operator has explicitly enabled force output.
         if (massFeedback != null)
             massFeedback.SetHeavyHeld(source == hapticInput && held != null && held.anomalous);
     }
 
-    private void TryGrab(Vector3 cursor)
+    private void StartPractice()
     {
-        DemoCanister closest = null;
-        float distance = float.PositiveInfinity;
-        foreach (DemoCanister canister in canisters)
+        BeginSession(TrialState.Practice);
+        lastMessage = "Practice running: feel the virtual heavy cue and sort samples.";
+    }
+
+    private void StartTrial()
+    {
+        BeginSession(TrialState.Trial);
+        sessionId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
+        lastMessage = "Timed trial started. Sort all ten visually identical samples.";
+    }
+
+    private void BeginSession(TrialState newState)
+    {
+        StopAllCoroutines();
+        transitionInProgress = false;
+        held = null;
+        priorGrabHeld = false;
+        processed = 0;
+        correct = 0;
+        drops = 0;
+        practicePlacements = 0;
+        currentSampleDrops = 0;
+        finalTrialSeconds = 0;
+        exportedCsvPath = null;
+        trialRecords.Clear();
+        if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        keyboardInput.movementMultiplier = 1f;
+        keyboardInput.SetPosition(initialCursorPosition);
+        HideAllSamples();
+
+        // Exactly half of the ten objects are anomalous by default.
+        // Shuffle positions to avoid a fixed predictable pattern.
+        int anomalousCount = samples.Count / 2;
+        for (int i = 0; i < classification.Length; i++)
+            classification[i] = i < anomalousCount;
+        for (int i = 0; i < classification.Length; i++)
         {
-            if (canister == null || canister.Sorted) continue;
-            Bounds bounds = canister.VisibleBounds;
-            float d = Vector3.Distance(bounds.ClosestPoint(cursor), cursor);
-            if (d < distance) { closest = canister; distance = d; }
+            int swapIndex = UnityEngine.Random.Range(i, classification.Length);
+            bool value = classification[i];
+            classification[i] = classification[swapIndex];
+            classification[swapIndex] = value;
         }
 
-        if (closest == null || distance > grabRange)
+        state = newState;
+        stateStartTime = Time.unscaledTime;
+        ShowNextSample();
+    }
+
+    private void ShowNextSample()
+    {
+        if (state == TrialState.Trial && processed >= samples.Count)
         {
-            lastMessage = "No box within reach. Move the cyan cursor closer.";
+            CompleteTrial();
             return;
         }
+        if (state != TrialState.Trial && state != TrialState.Practice)
+            return;
 
-        held = closest;
-        holdOffset = closest.VisibleBounds.center - cursor;
-        lastMessage = "Holding a canister. Move to a bin; release SPACE to drop.";
+        HideAllSamples();
+        int index = state == TrialState.Trial ? processed : practicePlacements % samples.Count;
+        currentSample = samples[index];
+        currentSample.ResetCanister();
+        currentSample.anomalous = state == TrialState.Trial
+            ? classification[index]
+            : practicePlacements % 2 == 1;
+        currentSample.gameObject.SetActive(true);
+        currentSample.ShiftVisualCenterTo(spawnCenter);
+        currentSampleDrops = 0;
+        keyboardInput.SetPosition(initialCursorPosition);
+        keyboardInput.movementMultiplier = 1f;
+        priorGrabHeld = true; // Require Space to be released before the next pickup.
+    }
+
+    private void HideAllSamples()
+    {
+        foreach (DemoCanister sample in samples)
+            if (sample != null) sample.gameObject.SetActive(false);
+        currentSample = null;
+    }
+
+    private void TryGrab(Vector3 cursor)
+    {
+        if (currentSample == null || currentSample.Sorted) return;
+        Bounds bounds = currentSample.VisibleBounds;
+        float distance = Vector3.Distance(bounds.ClosestPoint(cursor), cursor);
+        if (distance > grabRange)
+        {
+            lastMessage = "Move the cyan cursor closer before grabbing.";
+            return;
+        }
+        held = currentSample;
+        holdOffset = currentSample.VisibleBounds.center - cursor;
+        lastMessage = "Holding a sample. LEFT bin = standard; RIGHT bin = reject.";
     }
 
     private void Release(Vector3 cursor)
     {
-        Bounds a = RendererBounds(binAStandard);
-        Bounds b = RendererBounds(binBReject);
-        float horizontalA = HorizontalDistance(cursor, a.center);
-        float horizontalB = HorizontalDistance(cursor, b.center);
-        bool nearA = horizontalA <= BinRadius(a);
-        bool nearB = horizontalB <= BinRadius(b);
-        if (nearA && nearB)
-        {
-            nearA = horizontalA <= horizontalB;
-            nearB = !nearA;
-        }
+        DemoCanister droppedSample = held;
+        held = null;
+        if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+
+        Bounds standard = RendererBounds(binAStandard);
+        Bounds reject = RendererBounds(binBReject);
+        float distanceA = HorizontalDistance(cursor, standard.center);
+        float distanceB = HorizontalDistance(cursor, reject.center);
+        bool nearA = distanceA <= BinRadius(standard);
+        bool nearB = distanceB <= BinRadius(reject);
+        if (nearA && nearB) { nearA = distanceA <= distanceB; nearB = !nearA; }
 
         if (!nearA && !nearB)
         {
-            lastMessage = "Released outside a bin. Pick the canister up again.";
-            held = null;
+            drops++;
+            currentSampleDrops++;
+            lastMessage = "Dropped outside a bin. Sample returns to conveyor; try again.";
+            StartCoroutine(AnimateTo(droppedSample, spawnCenter, false, false));
             return;
         }
 
-        bool placedInA = nearA;
-        bool rightBin = placedInA != held.anomalous;
-        Bounds chosen = placedInA ? a : b;
+        bool placedInReject = nearB;
+        bool correctPlacement = placedInReject == droppedSample.anomalous;
+        Bounds chosenBin = placedInReject ? reject : standard;
+        Vector3 finalCenter = new Vector3(chosenBin.center.x,
+            chosenBin.max.y - Mathf.Min(droppedSample.VisibleBounds.extents.y, 0.3f),
+            chosenBin.center.z);
 
-        // Reposition the rendered container inside its selected bin.
-        float top = chosen.max.y;
-        Vector3 landingCenter = new Vector3(chosen.center.x,
-            top - Mathf.Min(held.VisibleBounds.extents.y, 0.3f), chosen.center.z);
-        held.ShiftVisualCenterTo(landingCenter);
-        held.MarkSorted();
-        processed++;
-        if (rightBin) correct++;
-        lastMessage = rightBin ? "CORRECT!" : "Incorrect bin. Try another canister.";
-        held = null;
+        if (state == TrialState.Trial)
+        {
+            processed++;
+            if (correctPlacement) correct++;
+            trialRecords.Add(new SortRecord
+            {
+                CanisterNumber = processed,
+                WasAnomalous = droppedSample.anomalous,
+                PlacedInRejectBin = placedInReject,
+                Correct = correctPlacement,
+                DropsBeforeSort = currentSampleDrops,
+                ElapsedSeconds = Time.unscaledTime - stateStartTime
+            });
+        }
+        else
+        {
+            practicePlacements++;
+        }
+        droppedSample.MarkSorted();
+        lastMessage = correctPlacement ? "CORRECT: sample classified." : "INCORRECT: sample placed in the wrong bin.";
+        StartCoroutine(AnimateTo(droppedSample, finalCenter, true, true));
+    }
+
+    private IEnumerator AnimateTo(DemoCanister sample, Vector3 endCenter, bool sorted, bool moveOn)
+    {
+        transitionInProgress = true;
+        Vector3 startCenter = sample.VisibleBounds.center;
+        float duration = Mathf.Max(0.05f, placementAnimationSeconds);
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / duration);
+            t = t * t * (3f - 2f * t);
+            sample.ShiftVisualCenterTo(Vector3.Lerp(startCenter, endCenter, t));
+            yield return null;
+        }
+        sample.ShiftVisualCenterTo(endCenter);
+        if (sorted)
+        {
+            sample.gameObject.SetActive(false);
+            currentSample = null;
+        }
+        transitionInProgress = false;
+        if (moveOn) ShowNextSample();
     }
 
     private static float HorizontalDistance(Vector3 one, Vector3 two)
@@ -240,43 +426,92 @@ public sealed class Demo1Controller : MonoBehaviour
         return Vector2.Distance(new Vector2(one.x, one.z), new Vector2(two.x, two.z));
     }
 
-    private float BinRadius(Bounds bounds)
+    private float BinRadius(Bounds bin)
     {
-        return Mathf.Max(bounds.extents.x, bounds.extents.z) + binExtraRadius;
+        return Mathf.Max(bin.extents.x, bin.extents.z) + binExtraRadius;
     }
 
-    private void ResetDemo()
+    private void CompleteTrial()
     {
+        finalTrialSeconds = Time.unscaledTime - stateStartTime;
+        state = TrialState.Complete;
+        HideAllSamples();
+        keyboardInput.movementMultiplier = 1f;
+        if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        float accuracy = processed > 0 ? (100f * correct / processed) : 0f;
+        lastMessage = string.Format("FINISHED: {0}/{1} correct ({2:0}%), {3} drops, {4:0.0} seconds.",
+            correct, processed, accuracy, drops, finalTrialSeconds);
+        Debug.Log("Demo1 V4: " + lastMessage);
+        exportedCsvPath = Demo1SessionLogger.SaveMassTrial(sessionId,
+            trialRecords, correct, drops, finalTrialSeconds);
+    }
+
+    private void ResetToReady()
+    {
+        StopAllCoroutines();
         held = null;
         priorGrabHeld = false;
+        transitionInProgress = false;
+        if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (keyboardInput != null)
+        {
+            keyboardInput.movementMultiplier = 1f;
+            keyboardInput.SetPosition(initialCursorPosition);
+        }
+        HideAllSamples();
         processed = 0;
         correct = 0;
-        foreach (DemoCanister canister in canisters)
-            if (canister != null) canister.ResetCanister();
-        keyboardInput.SetPosition(initialCursorPosition);
-        keyboardInput.movementMultiplier = 1f;
-        lastMessage = "Reset complete. Start with a canister on the conveyor.";
+        drops = 0;
+        practicePlacements = 0;
+        currentSampleDrops = 0;
+        finalTrialSeconds = 0;
+        exportedCsvPath = null;
+        trialRecords.Clear();
+        state = TrialState.Ready;
+        lastMessage = "Ready. ENTER starts a 10-sample trial; P starts 60-second practice.";
+    }
+
+    private void OnDisable()
+    {
+        if (massFeedback != null) massFeedback.SetHeavyHeld(false);
     }
 
     private void OnGUI()
     {
         if (initializationFailed) return;
+        Matrix4x4 oldMatrix = GUI.matrix;
+        float scale = Mathf.Clamp(Screen.width / 1100f, 1f, 3f);
+        GUI.matrix = Matrix4x4.Scale(new Vector3(scale, scale, 1f));
 
-        // At the repo's default QHD Game resolution, the Game tab is often
-        // zoomed out. Scale the HUD so messages stay legible while testing.
-        Matrix4x4 previousMatrix = GUI.matrix;
-        float hudScale = Mathf.Clamp(Screen.width / 1100f, 1f, 3f);
-        GUI.matrix = Matrix4x4.Scale(new Vector3(hudScale, hudScale, 1f));
-        GUI.Box(new Rect(8, 8, 610, 142), "Demo 1 | Mass-Based Identification");
-        string sourceName = SelectedInput() == hapticInput ? "Haptic device" : "Keyboard simulator";
-        GUI.Label(new Rect(22, 32, 580, 22), "Control: " + sourceName + " | Requested: " + inputMode);
-        GUI.Label(new Rect(22, 52, 580, 22), "W/A/S/D: move | E/Q: up/down | SPACE: hold to grab | SHIFT: faster");
-        GUI.Label(new Rect(22, 72, 580, 22), "TAB: switch input | R: reset | Left bin: standard | Right bin: reject");
-        GUI.Label(new Rect(22, 92, 580, 22), "Sorted: " + processed + "/" + canisters.Length + " | Correct: " + correct + " | " + lastMessage);
-        if (held != null && showDebugClassWhileHeld)
-            GUI.Label(new Rect(22, 112, 580, 22), "DEVELOPER ONLY: " + (held.anomalous ? "HEAVY / ANOMALOUS" : "NORMAL"));
+        GUI.Box(new Rect(8, 8, 650, 188), "APP A | Mass-Based Identification (keyboard simulation)");
+        string sourceName = SelectedInput() == hapticInput ? "Physical Touch" : "Keyboard";
+        GUI.Label(new Rect(22, 31, 630, 22), "Mode: " + state + " | Input: " + sourceName + " | Left: STANDARD | Right: REJECT");
+        GUI.Label(new Rect(22, 53, 630, 22), "WASD move | Q/E up/down | Hold SPACE grab | SHIFT fast | R reset");
+        GUI.Label(new Rect(22, 75, 630, 22), "ENTER timed trial | P 60s practice | TAB toggle input | Ctrl+D debug class");
+
+        string metrics;
+        if (state == TrialState.Trial)
+            metrics = string.Format("Sample: {0}/{1} | Correct: {2}/{3} | Drops: {4} | Time: {5:0.0}s",
+                Mathf.Min(processed + 1, samples.Count), samples.Count, correct, processed, drops,
+                Time.unscaledTime - stateStartTime);
+        else if (state == TrialState.Practice)
+            metrics = string.Format("Practice: {0:0}s left | Completed samples: {1} | Drops: {2}",
+                Mathf.Max(0f, practiceSeconds - (Time.unscaledTime - stateStartTime)), practicePlacements, drops);
+        else if (state == TrialState.Complete)
+            metrics = string.Format("FINISHED | Correct: {0}/{1} | Accuracy: {2:0}% | Drops: {3} | Time: {4:0.0}s",
+                correct, processed, processed > 0 ? 100f * correct / processed : 0f, drops, finalTrialSeconds);
         else
-            GUI.Label(new Rect(22, 112, 580, 22), "Keyboard movement resistance is a test cue, NOT physical force.");
-        GUI.matrix = previousMatrix;
+            metrics = "READY | 10 identical-looking samples | 5 standard + 5 heavy";
+
+        GUI.Label(new Rect(22, 97, 630, 22), metrics);
+        GUI.Label(new Rect(22, 119, 630, 22), lastMessage);
+        if (showDebugClassWhileHeld && currentSample != null)
+            GUI.Label(new Rect(22, 141, 630, 22), "DEVELOPER ONLY — current: " +
+                (currentSample.anomalous ? "HEAVY / REJECT" : "NORMAL / STANDARD"));
+        else
+            GUI.Label(new Rect(22, 141, 630, 22), "A heavy sample moves slower while grabbed; no physical force is simulated.");
+        if (!string.IsNullOrEmpty(exportedCsvPath))
+            GUI.Label(new Rect(22, 163, 630, 22), "CSV saved. Full location printed in Unity Console.");
+        GUI.matrix = oldMatrix;
     }
 }
