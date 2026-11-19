@@ -13,7 +13,8 @@ using UnityEngine.InputSystem;
 /// Only one sample is presented at a time to avoid changing the authored scene.
 ///
 /// Keyboard resistance is a SUBSTITUTE cue, not a physical haptic force.
-/// Placement and failed-drop motions are visual animations, not rigidbody physics.
+/// V5 uses real Rigidbody/Collider physics for carried and released canisters.
+/// Scoring still uses the selected bin's horizontal footprint for demo reliability.
 /// </summary>
 public sealed class Demo1Controller : MonoBehaviour
 {
@@ -34,6 +35,11 @@ public sealed class Demo1Controller : MonoBehaviour
     [Min(0.05f)] public float placementAnimationSeconds = 0.35f;
     public bool showCursor = true;
     public bool showDebugClassWhileHeld = false;
+
+    [Header("V5 collision-aware movement")]
+    [Min(1f)] public float heldFollowResponsiveness = 18f;
+    [Min(0.5f)] public float heldMaxSpeed = 9f;
+    [Min(0.1f)] public float releasePhysicsSeconds = 0.8f;
 
     [Header("Scene references (auto-found if empty)")]
     public Transform binAStandard;
@@ -56,6 +62,8 @@ public sealed class Demo1Controller : MonoBehaviour
     private Demo1MassHapticEffect massFeedback;
     private Transform cursorVisual;
     private DemoCanister held;
+    private Rigidbody heldBody;
+    private Vector3 desiredHeldCenter;
     private DemoCanister currentSample;
     private Vector3 holdOffset;
     private Vector3 spawnCenter;
@@ -125,6 +133,10 @@ public sealed class Demo1Controller : MonoBehaviour
         if (primary == null || firstBin == null || secondBin == null)
             return false;
 
+        // Static triangle-mesh colliders preserve the imported floor, wall,
+        // conveyor, and open-bin shapes. They are created at runtime only.
+        Demo1PhysicsSetup.AddEnvironmentColliders();
+
         if (binAStandard == null || binBReject == null)
         {
             Vector3 screenRight = Camera.main != null ? Camera.main.transform.right : Vector3.right;
@@ -147,6 +159,7 @@ public sealed class Demo1Controller : MonoBehaviour
             sampleObject.transform.localScale = primary.transform.localScale;
             DemoCanister sample = sampleObject.GetComponent<DemoCanister>();
             if (sample == null) sample = sampleObject.AddComponent<DemoCanister>();
+            Demo1PhysicsSetup.AddSampleBody(sample);
             // Existing DemoCanister records its original transform in Awake.
             samples.Add(sample);
             sampleObject.SetActive(false);
@@ -179,6 +192,18 @@ public sealed class Demo1Controller : MonoBehaviour
         if (inputMode != InputMode.Keyboard && hapticInput != null && hapticInput.IsAvailable)
             return hapticInput;
         return keyboardInput;
+    }
+
+    // Apply motion in the physics step so wall/floor/bin collisions can respond.
+    // Do not set the held canister's Transform position every Update.
+    private void FixedUpdate()
+    {
+        if (held == null || heldBody == null || transitionInProgress) return;
+        Vector3 error = desiredHeldCenter - held.VisibleBounds.center;
+        Vector3 velocity = Vector3.ClampMagnitude(
+            error * heldFollowResponsiveness, heldMaxSpeed);
+        heldBody.linearVelocity = velocity;
+        heldBody.angularVelocity = Vector3.zero;
     }
 
     private void Update()
@@ -237,8 +262,8 @@ public sealed class Demo1Controller : MonoBehaviour
         if (held == null && press) TryGrab(cursor);
         if (held != null)
         {
-            held.ShiftVisualCenterTo(cursor + holdOffset);
-            if (release) Release(cursor);
+            desiredHeldCenter = cursor + holdOffset;
+            if (release) Release();
         }
 
         keyboardInput.movementMultiplier = held != null && held.anomalous
@@ -265,6 +290,7 @@ public sealed class Demo1Controller : MonoBehaviour
         StopAllCoroutines();
         transitionInProgress = false;
         held = null;
+        heldBody = null;
         priorGrabHeld = false;
         processed = 0;
         correct = 0;
@@ -316,6 +342,7 @@ public sealed class Demo1Controller : MonoBehaviour
             : practicePlacements % 2 == 1;
         currentSample.gameObject.SetActive(true);
         currentSample.ShiftVisualCenterTo(spawnCenter);
+        Demo1PhysicsSetup.ReleaseAtRest(currentSample);
         currentSampleDrops = 0;
         keyboardInput.SetPosition(initialCursorPosition);
         keyboardInput.movementMultiplier = 1f;
@@ -325,7 +352,11 @@ public sealed class Demo1Controller : MonoBehaviour
     private void HideAllSamples()
     {
         foreach (DemoCanister sample in samples)
-            if (sample != null) sample.gameObject.SetActive(false);
+            if (sample != null)
+            {
+                Demo1PhysicsSetup.Freeze(sample);
+                sample.gameObject.SetActive(false);
+            }
         currentSample = null;
     }
 
@@ -340,20 +371,35 @@ public sealed class Demo1Controller : MonoBehaviour
             return;
         }
         held = currentSample;
+        heldBody = held.GetComponent<Rigidbody>();
+        if (heldBody == null)
+        {
+            Debug.LogError("Demo1 V5: Missing Rigidbody on sample.");
+            held = null;
+            return;
+        }
+        Demo1PhysicsSetup.BeginGrab(heldBody);
         holdOffset = currentSample.VisibleBounds.center - cursor;
-        lastMessage = "Holding a sample. LEFT bin = standard; RIGHT bin = reject.";
+        desiredHeldCenter = currentSample.VisibleBounds.center;
+        lastMessage = "Holding a sample. Physics prevents passing through solid objects.";
     }
 
-    private void Release(Vector3 cursor)
+    private void Release()
     {
         DemoCanister droppedSample = held;
+        Rigidbody releasedBody = heldBody;
         held = null;
+        heldBody = null;
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        Demo1PhysicsSetup.EndGrab(releasedBody);
 
+        // Score where the actual canister was released, NOT where the
+        // unconstrained stylus cursor went through a wall.
+        Vector3 objectCenter = droppedSample.VisibleBounds.center;
         Bounds standard = RendererBounds(binAStandard);
         Bounds reject = RendererBounds(binBReject);
-        float distanceA = HorizontalDistance(cursor, standard.center);
-        float distanceB = HorizontalDistance(cursor, reject.center);
+        float distanceA = HorizontalDistance(objectCenter, standard.center);
+        float distanceB = HorizontalDistance(objectCenter, reject.center);
         bool nearA = distanceA <= BinRadius(standard);
         bool nearB = distanceB <= BinRadius(reject);
         if (nearA && nearB) { nearA = distanceA <= distanceB; nearB = !nearA; }
@@ -362,18 +408,13 @@ public sealed class Demo1Controller : MonoBehaviour
         {
             drops++;
             currentSampleDrops++;
-            lastMessage = "Dropped outside a bin. Sample returns to conveyor; try again.";
-            StartCoroutine(AnimateTo(droppedSample, spawnCenter, false, false));
+            lastMessage = "Dropped outside a bin. Gravity applies, then the sample resets.";
+            StartCoroutine(WaitForPhysicsRelease(droppedSample, false));
             return;
         }
 
         bool placedInReject = nearB;
         bool correctPlacement = placedInReject == droppedSample.anomalous;
-        Bounds chosenBin = placedInReject ? reject : standard;
-        Vector3 finalCenter = new Vector3(chosenBin.center.x,
-            chosenBin.max.y - Mathf.Min(droppedSample.VisibleBounds.extents.y, 0.3f),
-            chosenBin.center.z);
-
         if (state == TrialState.Trial)
         {
             processed++;
@@ -393,32 +434,40 @@ public sealed class Demo1Controller : MonoBehaviour
             practicePlacements++;
         }
         droppedSample.MarkSorted();
-        lastMessage = correctPlacement ? "CORRECT: sample classified." : "INCORRECT: sample placed in the wrong bin.";
-        StartCoroutine(AnimateTo(droppedSample, finalCenter, true, true));
+        lastMessage = correctPlacement ? "CORRECT: sample classified." : "INCORRECT: wrong bin.";
+        StartCoroutine(WaitForPhysicsRelease(droppedSample, true));
     }
 
-    private IEnumerator AnimateTo(DemoCanister sample, Vector3 endCenter, bool sorted, bool moveOn)
+    // Leave the Rigidbody free to fall/collide before advancing or recovering.
+    // This replaces the older transform-based animations that passed through walls.
+    private IEnumerator WaitForPhysicsRelease(DemoCanister sample, bool sorted)
     {
         transitionInProgress = true;
-        Vector3 startCenter = sample.VisibleBounds.center;
-        float duration = Mathf.Max(0.05f, placementAnimationSeconds);
-        float elapsed = 0f;
-        while (elapsed < duration)
-        {
-            elapsed += Time.deltaTime;
-            float t = Mathf.Clamp01(elapsed / duration);
-            t = t * t * (3f - 2f * t);
-            sample.ShiftVisualCenterTo(Vector3.Lerp(startCenter, endCenter, t));
-            yield return null;
-        }
-        sample.ShiftVisualCenterTo(endCenter);
+        yield return new WaitForSeconds(releasePhysicsSeconds);
+        if (sample == null) yield break;
+
         if (sorted)
         {
             sample.gameObject.SetActive(false);
             currentSample = null;
+            transitionInProgress = false;
+            ShowNextSample();
         }
-        transitionInProgress = false;
-        if (moveOn) ShowNextSample();
+        else
+        {
+            // Keep the same sample and its accumulated drop count.
+            bool wasHeavy = sample.anomalous;
+            Demo1PhysicsSetup.Freeze(sample);
+            sample.ResetCanister();
+            sample.anomalous = wasHeavy;
+            sample.gameObject.SetActive(true);
+            sample.ShiftVisualCenterTo(spawnCenter);
+            Demo1PhysicsSetup.ReleaseAtRest(sample);
+            keyboardInput.SetPosition(initialCursorPosition);
+            keyboardInput.movementMultiplier = 1f;
+            priorGrabHeld = true; // Require a fresh button press.
+            transitionInProgress = false;
+        }
     }
 
     private static float HorizontalDistance(Vector3 one, Vector3 two)
@@ -450,6 +499,7 @@ public sealed class Demo1Controller : MonoBehaviour
     {
         StopAllCoroutines();
         held = null;
+        heldBody = null;
         priorGrabHeld = false;
         transitionInProgress = false;
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
@@ -483,7 +533,7 @@ public sealed class Demo1Controller : MonoBehaviour
         float scale = Mathf.Clamp(Screen.width / 1100f, 1f, 3f);
         GUI.matrix = Matrix4x4.Scale(new Vector3(scale, scale, 1f));
 
-        GUI.Box(new Rect(8, 8, 650, 188), "APP A | Mass-Based Identification (keyboard simulation)");
+        GUI.Box(new Rect(8, 8, 650, 188), "APP A | Mass-Based Identification (V5 physics)");
         string sourceName = SelectedInput() == hapticInput ? "Physical Touch" : "Keyboard";
         GUI.Label(new Rect(22, 31, 630, 22), "Mode: " + state + " | Input: " + sourceName + " | Left: STANDARD | Right: REJECT");
         GUI.Label(new Rect(22, 53, 630, 22), "WASD move | Q/E up/down | Hold SPACE grab | SHIFT fast | R reset");
@@ -509,7 +559,7 @@ public sealed class Demo1Controller : MonoBehaviour
             GUI.Label(new Rect(22, 141, 630, 22), "DEVELOPER ONLY — current: " +
                 (currentSample.anomalous ? "HEAVY / REJECT" : "NORMAL / STANDARD"));
         else
-            GUI.Label(new Rect(22, 141, 630, 22), "A heavy sample moves slower while grabbed; no physical force is simulated.");
+            GUI.Label(new Rect(22, 141, 630, 22), "Boxes collide with solids and fall under gravity; mass cue remains keyboard-only.");
         if (!string.IsNullOrEmpty(exportedCsvPath))
             GUI.Label(new Rect(22, 163, 630, 22), "CSV saved. Full location printed in Unity Console.");
         GUI.matrix = oldMatrix;
