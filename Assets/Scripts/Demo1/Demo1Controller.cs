@@ -15,6 +15,7 @@ public sealed class Demo1Controller : MonoBehaviour
     public InputMode inputMode = InputMode.Auto;
     public KeyboardStylusInput keyboardInput;
     public OpenHapticsStylusInput hapticInput;
+    private Demo1MassHapticEffect massFeedback;
 
     [Header("Existing scene objects (auto-found by name if empty)")]
     public DemoCanister[] canisters;
@@ -47,6 +48,7 @@ public sealed class Demo1Controller : MonoBehaviour
             keyboardInput = gameObject.AddComponent<KeyboardStylusInput>();
         if (hapticInput == null)
             hapticInput = gameObject.AddComponent<OpenHapticsStylusInput>();
+        massFeedback = gameObject.AddComponent<Demo1MassHapticEffect>();
 
         initialCursorPosition = canisters[0].VisibleBounds.center + Vector3.up * 0.2f;
         keyboardInput.SetPosition(initialCursorPosition);
@@ -135,6 +137,10 @@ public sealed class Demo1Controller : MonoBehaviour
                 inputMode = inputMode == InputMode.Keyboard ? InputMode.Haptics : InputMode.Keyboard;
         }
 
+        // Apply keyboard motion before sampling either input source, so the
+        // stylus and the grabbed mesh see the same updated position.
+        keyboardInput.SimulateFrame(Time.deltaTime);
+
         IStylusInput source = SelectedInput();
         if (source == null || !source.IsAvailable) return;
         Vector3 cursor = source.WorldPosition;
@@ -161,6 +167,12 @@ public sealed class Demo1Controller : MonoBehaviour
         // Keyboard feedback is movement resistance ONLY, not actual haptic force.
         keyboardInput.movementMultiplier = held != null && held.anomalous
             ? anomalousKeyboardMovementRatio : 1f;
+
+        // This is independent of keyboard movement slowdown. The actual Touch
+        // device produces a modest downward force ONLY while a heavy sample
+        // is held, if the operator has explicitly enabled force output.
+        if (massFeedback != null)
+            massFeedback.SetHeavyHeld(source == hapticInput && held != null && held.anomalous);
     }
 
     private void TryGrab(Vector3 cursor)

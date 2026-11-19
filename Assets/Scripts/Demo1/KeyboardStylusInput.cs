@@ -24,7 +24,9 @@ public sealed class KeyboardStylusInput : MonoBehaviour, IStylusInput
         if (referenceCamera == null) referenceCamera = Camera.main;
     }
 
-    private void Update()
+    // Called by Demo1Controller before it reads the cursor each frame.
+    // This prevents a one-frame order-dependent lag between input and visuals.
+    public void SimulateFrame(float deltaTime)
     {
         Keyboard kb = Keyboard.current;
         if (kb == null) return;
@@ -46,7 +48,7 @@ public sealed class KeyboardStylusInput : MonoBehaviour, IStylusInput
         motion = Vector3.ClampMagnitude(motion, 1f);
 
         float sprint = (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed) ? sprintMultiplier : 1f;
-        Vector3 next = transform.position + motion * (moveSpeed * movementMultiplier * sprint * Time.deltaTime);
+        Vector3 next = transform.position + motion * (moveSpeed * movementMultiplier * sprint * deltaTime);
         next.y = Mathf.Max(next.y, minimumHeight);
         transform.position = next;
     }
