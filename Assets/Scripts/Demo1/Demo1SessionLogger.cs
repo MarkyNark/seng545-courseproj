@@ -12,21 +12,21 @@ using UnityEngine;
 /// </summary>
 public static class Demo1SessionLogger
 {
-    public static string SaveMassTrial(string sessionId,
+    public static string SaveTrial(string application, string sessionId,
         IReadOnlyList<Demo1Controller.SortRecord> records,
         int totalCorrect, int totalDrops, float durationSeconds)
     {
         try
         {
-            string directory = Path.Combine(Application.persistentDataPath, "ENSF545_MassTrials");
+            string directory = Path.Combine(Application.persistentDataPath, "ENSF545_Trials");
             Directory.CreateDirectory(directory);
             string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
-            string filePath = Path.Combine(directory, "AppA_Keyboard_" + stamp + ".csv");
+            string filePath = Path.Combine(directory, application + "_" + stamp + ".csv");
             StringBuilder csv = new StringBuilder();
             csv.AppendLine("session_id,record_type,application,canister_number,actual_class,chosen_bin,is_correct,drops_before_sort,elapsed_seconds,total_correct,total_drops,total_duration_seconds");
             foreach (Demo1Controller.SortRecord record in records)
             {
-                csv.Append(sessionId).Append(",SAMPLE,AppA_MassKeyboard,");
+                csv.Append(sessionId).Append(",SAMPLE,").Append(application).Append(',');
                 csv.Append(record.CanisterNumber).Append(',');
                 csv.Append(record.WasAnomalous ? "anomalous" : "standard").Append(',');
                 csv.Append(record.PlacedInRejectBin ? "reject" : "standard").Append(',');
@@ -35,7 +35,7 @@ public static class Demo1SessionLogger
                 csv.Append(record.ElapsedSeconds.ToString("F3", CultureInfo.InvariantCulture));
                 csv.AppendLine(",,,");
             }
-            csv.Append(sessionId).Append(",SUMMARY,AppA_MassKeyboard,,,,,,,");
+            csv.Append(sessionId).Append(",SUMMARY,").Append(application).Append(",,,,,,,");
             csv.Append(totalCorrect).Append(',').Append(totalDrops).Append(',');
             csv.AppendLine(durationSeconds.ToString("F3", CultureInfo.InvariantCulture));
             File.WriteAllText(filePath, csv.ToString(), new UTF8Encoding(false));
