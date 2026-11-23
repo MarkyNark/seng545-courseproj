@@ -18,6 +18,14 @@ using UnityEngine.InputSystem;
 public sealed class Demo1Controller : MonoBehaviour
 {
     public enum InputMode { Keyboard, Haptics, Auto }
+    public enum ApplicationMode { MassA, SpringB }
+
+    [Header("Select application before starting a trial (1=A, 2=B)")]
+    public ApplicationMode applicationMode = ApplicationMode.MassA;
+
+    [Header("App B keyboard-only spring cue (not physical haptic feedback)")]
+    [Range(0f, 0.3f)] public float springKeyboardDisplacement = 0.12f;
+    [Range(1f, 10f)] public float springKeyboardFrequencyHz = 4.5f;
     private enum TrialState { Ready, Practice, Trial, Complete }
 
     [Header("Input adapter - Keyboard is the safe default for local testing")]
@@ -54,6 +62,8 @@ public sealed class Demo1Controller : MonoBehaviour
     private readonly List<SortRecord> trialRecords = new List<SortRecord>();
     private readonly List<GameObject> sourceBoxes = new List<GameObject>();
     private Demo1MassHapticEffect massFeedback;
+    private Demo1SpringHapticEffect springFeedback;
+    private float pickupTime;
     private Transform cursorVisual;
     private DemoCanister held;
     private DemoCanister currentSample;
@@ -92,6 +102,9 @@ public sealed class Demo1Controller : MonoBehaviour
         massFeedback = gameObject.GetComponent<Demo1MassHapticEffect>();
         if (massFeedback == null)
             massFeedback = gameObject.AddComponent<Demo1MassHapticEffect>();
+        springFeedback = gameObject.GetComponent<Demo1SpringHapticEffect>();
+        if (springFeedback == null)
+            springFeedback = gameObject.AddComponent<Demo1SpringHapticEffect>();
 
         initialCursorPosition = spawnCenter + Vector3.up * 0.2f;
         keyboardInput.SetPosition(initialCursorPosition);
@@ -194,6 +207,21 @@ public sealed class Demo1Controller : MonoBehaviour
             if (kb.tabKey.wasPressedThisFrame)
                 inputMode = inputMode == InputMode.Keyboard ? InputMode.Auto : InputMode.Keyboard;
 
+            // Never change experimental conditions during a trial or practice.
+            if (state == TrialState.Ready)
+            {
+                if (kb.digit1Key.wasPressedThisFrame)
+                {
+                    applicationMode = ApplicationMode.MassA;
+                    lastMessage = "App A selected. Press ENTER for trial or P for practice.";
+                }
+                else if (kb.digit2Key.wasPressedThisFrame)
+                {
+                    applicationMode = ApplicationMode.SpringB;
+                    lastMessage = "App B selected. Press ENTER for trial or P for practice.";
+                }
+            }
+
             if (!transitionInProgress &&
                 (state == TrialState.Ready || state == TrialState.Complete))
             {
@@ -231,33 +259,56 @@ public sealed class Demo1Controller : MonoBehaviour
         {
             keyboardInput.movementMultiplier = 1f;
             if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+            if (springFeedback != null) springFeedback.SetSpringHeld(false);
             return;
         }
 
         if (held == null && press) TryGrab(cursor);
         if (held != null)
         {
-            held.ShiftVisualCenterTo(cursor + holdOffset);
+            Vector3 desiredCenter = cursor + holdOffset;
+            if (applicationMode == ApplicationMode.SpringB && held.anomalous && source == keyboardInput)
+            {
+                // Development-only visible/kinematic proxy for spring feedback.
+                // A keyboard cannot reproduce physical forces; this should not
+                // be used to collect real haptic participant responses.
+                float elapsed = Time.unscaledTime - pickupTime;
+                float wobble = springKeyboardDisplacement *
+                    Mathf.Sin(elapsed * 2f * Mathf.PI * springKeyboardFrequencyHz);
+                desiredCenter += Camera.main != null
+                    ? Camera.main.transform.right * wobble
+                    : Vector3.right * wobble;
+            }
+            held.ShiftVisualCenterTo(desiredCenter);
             if (release) Release(cursor);
         }
 
-        keyboardInput.movementMultiplier = held != null && held.anomalous
-            ? anomalousKeyboardMovementRatio : 1f;
+        keyboardInput.movementMultiplier =
+            applicationMode == ApplicationMode.MassA && held != null && held.anomalous
+                ? anomalousKeyboardMovementRatio : 1f;
+
+        bool physicalAnomalyHeld = source == hapticInput && held != null && held.anomalous;
         if (massFeedback != null)
-            massFeedback.SetHeavyHeld(source == hapticInput && held != null && held.anomalous);
+            massFeedback.SetHeavyHeld(physicalAnomalyHeld && applicationMode == ApplicationMode.MassA);
+        if (springFeedback != null)
+            springFeedback.SetSpringHeld(physicalAnomalyHeld && applicationMode == ApplicationMode.SpringB);
     }
 
     private void StartPractice()
     {
         BeginSession(TrialState.Practice);
-        lastMessage = "Practice running: feel the virtual heavy cue and sort samples.";
+        lastMessage = applicationMode == ApplicationMode.MassA
+            ? "Practice: distinguish heavy versus normal samples."
+            : "Practice: distinguish bouncing versus smooth samples.";
     }
 
     private void StartTrial()
     {
         BeginSession(TrialState.Trial);
         sessionId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
-        lastMessage = "Timed trial started. Sort all ten visually identical samples.";
+        lastMessage = applicationMode == ApplicationMode.MassA
+            ? "App A timed trial: sort ten normal or heavy samples."
+            : "App B timed trial: sort ten smooth or bouncy samples.";
     }
 
     private void BeginSession(TrialState newState)
@@ -275,6 +326,7 @@ public sealed class Demo1Controller : MonoBehaviour
         exportedCsvPath = null;
         trialRecords.Clear();
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (springFeedback != null) springFeedback.SetSpringHeld(false);
         keyboardInput.movementMultiplier = 1f;
         keyboardInput.SetPosition(initialCursorPosition);
         HideAllSamples();
@@ -340,6 +392,7 @@ public sealed class Demo1Controller : MonoBehaviour
             return;
         }
         held = currentSample;
+        pickupTime = Time.unscaledTime;
         holdOffset = currentSample.VisibleBounds.center - cursor;
         lastMessage = "Holding a sample. LEFT bin = standard; RIGHT bin = reject.";
     }
@@ -349,6 +402,7 @@ public sealed class Demo1Controller : MonoBehaviour
         DemoCanister droppedSample = held;
         held = null;
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (springFeedback != null) springFeedback.SetSpringHeld(false);
 
         Bounds standard = RendererBounds(binAStandard);
         Bounds reject = RendererBounds(binBReject);
@@ -438,12 +492,16 @@ public sealed class Demo1Controller : MonoBehaviour
         HideAllSamples();
         keyboardInput.movementMultiplier = 1f;
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (springFeedback != null) springFeedback.SetSpringHeld(false);
         float accuracy = processed > 0 ? (100f * correct / processed) : 0f;
         lastMessage = string.Format("FINISHED: {0}/{1} correct ({2:0}%), {3} drops, {4:0.0} seconds.",
             correct, processed, accuracy, drops, finalTrialSeconds);
         Debug.Log("Demo1 V4: " + lastMessage);
-        exportedCsvPath = Demo1SessionLogger.SaveMassTrial(sessionId,
-            trialRecords, correct, drops, finalTrialSeconds);
+        bool touchWasSelected = SelectedInput() == hapticInput && hapticInput != null && hapticInput.IsAvailable;
+        string trialMode = applicationMode == ApplicationMode.MassA ? "AppA_Mass" : "AppB_Spring";
+        string inputSource = touchWasSelected ? "_Touch" : "_Keyboard";
+        exportedCsvPath = Demo1SessionLogger.SaveTrial(
+            trialMode + inputSource, sessionId, trialRecords, correct, drops, finalTrialSeconds);
     }
 
     private void ResetToReady()
@@ -453,6 +511,7 @@ public sealed class Demo1Controller : MonoBehaviour
         priorGrabHeld = false;
         transitionInProgress = false;
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (springFeedback != null) springFeedback.SetSpringHeld(false);
         if (keyboardInput != null)
         {
             keyboardInput.movementMultiplier = 1f;
@@ -474,6 +533,7 @@ public sealed class Demo1Controller : MonoBehaviour
     private void OnDisable()
     {
         if (massFeedback != null) massFeedback.SetHeavyHeld(false);
+        if (springFeedback != null) springFeedback.SetSpringHeld(false);
     }
 
     private void OnGUI()
@@ -483,11 +543,13 @@ public sealed class Demo1Controller : MonoBehaviour
         float scale = Mathf.Clamp(Screen.width / 1100f, 1f, 3f);
         GUI.matrix = Matrix4x4.Scale(new Vector3(scale, scale, 1f));
 
-        GUI.Box(new Rect(8, 8, 650, 188), "APP A | Mass-Based Identification (keyboard simulation)");
+        string appTitle = applicationMode == ApplicationMode.MassA
+            ? "APP A | Mass-Based Identification" : "APP B | Bouncy/Spring Identification";
+        GUI.Box(new Rect(8, 8, 650, 188), appTitle + " (keyboard simulator)");
         string sourceName = SelectedInput() == hapticInput ? "Physical Touch" : "Keyboard";
         GUI.Label(new Rect(22, 31, 630, 22), "Mode: " + state + " | Input: " + sourceName + " | Left: STANDARD | Right: REJECT");
         GUI.Label(new Rect(22, 53, 630, 22), "WASD move | Q/E up/down | Hold SPACE grab | SHIFT fast | R reset");
-        GUI.Label(new Rect(22, 75, 630, 22), "ENTER timed trial | P 60s practice | TAB toggle input | Ctrl+D debug class");
+        GUI.Label(new Rect(22, 75, 630, 22), "ENTER trial | P practice | 1=Mass A, 2=Spring B (when ready) | TAB input");
 
         string metrics;
         if (state == TrialState.Trial)
@@ -501,15 +563,20 @@ public sealed class Demo1Controller : MonoBehaviour
             metrics = string.Format("FINISHED | Correct: {0}/{1} | Accuracy: {2:0}% | Drops: {3} | Time: {4:0.0}s",
                 correct, processed, processed > 0 ? 100f * correct / processed : 0f, drops, finalTrialSeconds);
         else
-            metrics = "READY | 10 identical-looking samples | 5 standard + 5 heavy";
+            metrics = "READY | 10 identical-looking samples | 5 standard + 5 anomalous";
 
         GUI.Label(new Rect(22, 97, 630, 22), metrics);
         GUI.Label(new Rect(22, 119, 630, 22), lastMessage);
         if (showDebugClassWhileHeld && currentSample != null)
             GUI.Label(new Rect(22, 141, 630, 22), "DEVELOPER ONLY — current: " +
-                (currentSample.anomalous ? "HEAVY / REJECT" : "NORMAL / STANDARD"));
+                (currentSample.anomalous
+                    ? (applicationMode == ApplicationMode.MassA ? "HEAVY / REJECT" : "BOUNCY / REJECT")
+                    : "STANDARD"));
         else
-            GUI.Label(new Rect(22, 141, 630, 22), "A heavy sample moves slower while grabbed; no physical force is simulated.");
+            GUI.Label(new Rect(22, 141, 630, 22),
+                applicationMode == ApplicationMode.MassA
+                    ? "Mass keyboard cue: heavy samples move slower."
+                    : "Spring keyboard cue: bouncy samples oscillate while grabbed (visual proxy).");
         if (!string.IsNullOrEmpty(exportedCsvPath))
             GUI.Label(new Rect(22, 163, 630, 22), "CSV saved. Full location printed in Unity Console.");
         GUI.matrix = oldMatrix;
