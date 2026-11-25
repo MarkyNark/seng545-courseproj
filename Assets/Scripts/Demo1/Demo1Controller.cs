@@ -47,6 +47,14 @@ public sealed class Demo1Controller : MonoBehaviour
     public Transform binAStandard;
     public Transform binBReject;
 
+    [Header("Spawn points (separate objects, found by Tag if not assigned)")]
+    [Tooltip("The Box that samples are cloned from / appear on. Falls back to the object named 'Box'.")]
+    public Transform boxSpawnPoint;
+    public string boxTag = "Box";
+    [Tooltip("Empty GameObject marking where the cyan cursor starts. Falls back to 0.2 above the Box.")]
+    public Transform cursorSpawnPoint;
+    public string cursorSpawnTag = "CursorSpawn";
+
     /// <summary>One completed placement in a timed mass-sorting trial.</summary>
     public struct SortRecord
     {
@@ -106,7 +114,14 @@ public sealed class Demo1Controller : MonoBehaviour
         if (springFeedback == null)
             springFeedback = gameObject.AddComponent<Demo1SpringHapticEffect>();
 
-        initialCursorPosition = spawnCenter + Vector3.up * 0.2f;
+        if (cursorSpawnPoint == null)
+            cursorSpawnPoint = FindByTag(cursorSpawnTag);
+        initialCursorPosition = cursorSpawnPoint != null
+            ? cursorSpawnPoint.position
+            : spawnCenter + Vector3.up * 0.2f;
+        if (cursorSpawnPoint == null)
+            Debug.LogWarning("Demo1: No object tagged '" + cursorSpawnTag +
+                             "' found; cursor spawns 0.2 above the Box instead.");
         keyboardInput.SetPosition(initialCursorPosition);
 
         GameObject sphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
@@ -122,6 +137,22 @@ public sealed class Demo1Controller : MonoBehaviour
         HideAllSamples();
     }
 
+    // Tag lookup that doesn't throw if the tag hasn't been created in Tags & Layers.
+    private static Transform FindByTag(string tagName)
+    {
+        if (string.IsNullOrEmpty(tagName)) return null;
+        try
+        {
+            GameObject found = GameObject.FindWithTag(tagName);
+            return found != null ? found.transform : null;
+        }
+        catch (UnityException)
+        {
+            Debug.LogWarning("Demo1: Tag '" + tagName + "' is not defined. Add it under Tags & Layers.");
+            return null;
+        }
+    }
+
     private bool SetupAuthoredScene()
     {
         string[] boxNames = { "Box", "Box (1)", "Box (2)" };
@@ -130,7 +161,9 @@ public sealed class Demo1Controller : MonoBehaviour
             GameObject box = GameObject.Find(name);
             if (box != null) sourceBoxes.Add(box);
         }
-        GameObject primary = GameObject.Find("Box");
+        if (boxSpawnPoint == null)
+            boxSpawnPoint = FindByTag(boxTag);
+        GameObject primary = boxSpawnPoint != null ? boxSpawnPoint.gameObject : GameObject.Find("Box");
         if (primary == null && sourceBoxes.Count > 0)
             primary = sourceBoxes[0];
         GameObject firstBin = GameObject.Find("bin (1)");
